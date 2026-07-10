@@ -17,6 +17,22 @@ class BleUart extends EventTarget {
     this.connected = false;
     this._lineBuffer = "";
     this._pending = [];
+    // Il Web Bluetooth dello stack browser accetta una sola operazione
+    // GATT alla volta per device: sendCommand/getBuf possono essere
+    // chiamati concorrentemente da moduli diversi (settings.js, app.js,
+    // messaging.js), quindi li seriamo tutti su questa catena invece di
+    // lasciare che le loro writeValueWithoutResponse si accavallino
+    // ("GATT operation already in progress").
+    this._commandChain = Promise.resolve();
+  }
+
+  _enqueue(taskFn) {
+    const result = this._commandChain.then(taskFn, taskFn);
+    this._commandChain = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
   }
 
   // Deve essere chiamato da un gesto utente (tap su "Collega nodo").
@@ -34,10 +50,14 @@ class BleUart extends EventTarget {
   // GETBUF e inoltro di ogni pacchetto scaricato come evento "rxpkt".
   async _drainBuffer() {
     try {
-      const { packets } = await this.getBuf();
+      const { count, packets } = await this.getBuf();
+      console.log(`[BLE] GETBUF: ${count} pacchetto/i nel buffer del nodo`);
       for (const hex of packets) this.dispatchEvent(new CustomEvent("rxpkt", { detail: hex }));
     } catch (err) {
-      // silenzioso: si ritenta alla prossima connessione/riconnessione
+      // GETBUF svuota il buffer del nodo: se questa chiamata fallisce in
+      // silenzio, il pacchetto può risultare "perso" ai tentativi successivi
+      // pur non essendoci nessun errore visibile lì — per questo logga qui.
+      console.warn("[BLE] GETBUF fallito:", err.message);
     }
   }
 
@@ -71,6 +91,14 @@ class BleUart extends EventTarget {
 
     await this.txChar.startNotifications();
     this.txChar.addEventListener("characteristicvaluechanged", (ev) => this._onNotify(ev));
+
+    // Margine per lasciare che un eventuale bonding di sistema (Android,
+    // alla primissima connessione a un device non ancora bondato) finisca
+    // prima che WHOAMI parta: altrimenti lo stack GATT del telefono può
+    // rifiutare la scrittura con "operation already in progress" perché
+    // è ancora occupato lui, non per una nostra race interna (quella è
+    // già serializzata da _enqueue).
+    await new Promise((r) => setTimeout(r, 300));
 
     this._lineBuffer = "";
     this.connected = true;
@@ -110,7 +138,18 @@ class BleUart extends EventTarget {
       }
       return;
     }
-    // Notifica non sollecitata (es. "ID ..." automatico alla connessione).
+    // "ID ..." è automatica alla connessione (da contratto): la
+    // intercettiamo qui per evitare che ogni modulo interessato debba
+    // interrogare di nuovo il nodo con un proprio WHOAMI — un secondo
+    // comando concorrente non serve e su alcuni device è bastato a far
+    // cadere la connessione appena stabilita.
+    const idMatch = /^ID (\d+) (.+)$/.exec(line);
+    if (idMatch) {
+      this.dispatchEvent(
+        new CustomEvent("identity", { detail: { id: idMatch[1], name: idMatch[2] } })
+      );
+    }
+
     this.dispatchEvent(new CustomEvent("line", { detail: line }));
   }
 
@@ -118,7 +157,21 @@ class BleUart extends EventTarget {
     if (!this.connected || !this.rxChar) throw new Error("BLE non connesso");
     const bytes = new TextEncoder().encode(line + "\n");
     for (let offset = 0; offset < bytes.length; offset += WRITE_CHUNK) {
-      await this.rxChar.writeValueWithoutResponse(bytes.slice(offset, offset + WRITE_CHUNK));
+      await this._writeChunkWithRetry(bytes.slice(offset, offset + WRITE_CHUNK));
+    }
+  }
+
+  // "GATT operation already in progress" e simili sono transitori (lo
+  // stack Bluetooth del telefono è temporaneamente occupato, es. bonding
+  // di sistema in corso): ritenta con un piccolo backoff invece di
+  // fallire subito al primo colpo.
+  async _writeChunkWithRetry(chunk, attempt = 0) {
+    try {
+      await this.rxChar.writeValueWithoutResponse(chunk);
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+      return this._writeChunkWithRetry(chunk, attempt + 1);
     }
   }
 
@@ -136,7 +189,11 @@ class BleUart extends EventTarget {
 
   // Comandi a risposta singola: WHOAMI, SET_NODE_ID, SET_PRESET,
   // SET_TRANSPORT, STATUS, TXPKT.
-  async sendCommand(line, { timeoutMs = 4000 } = {}) {
+  sendCommand(line, opts) {
+    return this._enqueue(() => this._sendCommandNow(line, opts));
+  }
+
+  async _sendCommandNow(line, { timeoutMs = 4000 } = {}) {
     const pending = this._queueRequest((lines) => lines.length >= 1, timeoutMs);
     await this._write(line);
     const lines = await pending;
@@ -144,7 +201,11 @@ class BleUart extends EventTarget {
   }
 
   // GETBUF: "BUF <n>" seguito da n righe "RXPKT <hex>".
-  async getBuf({ timeoutMs = 8000 } = {}) {
+  getBuf(opts) {
+    return this._enqueue(() => this._getBufNow(opts));
+  }
+
+  async _getBufNow({ timeoutMs = 8000 } = {}) {
     const pending = this._queueRequest((lines) => {
       if (lines.length === 0) return false;
       const m = /^BUF (\d+)$/.exec(lines[0]);
