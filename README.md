@@ -1,9 +1,9 @@
 [README.md](https://github.com/user-attachments/files/29673014/README.md)
 <div align="center">
 
-<img src="logo.png" alt="Walkie LoRa" width="260">
+<img src="logo.png" alt="MeshSRP" width="260">
 
-# Walkie LoRa
+# MeshSRP
 
 **Rete di comunicazione privata, cifrata, senza internet — ESP32 + LoRa + Bluetooth**
 
@@ -19,7 +19,7 @@
 
 ## Cos'è
 
-Walkie LoRa è una rete privata di dispositivi ESP32 + modulo LoRa **DX-LR02** che si scambiano messaggi di testo **cifrati** (AES-128-GCM) senza alcuna infrastruttura: niente SIM, niente internet, niente server. Ogni dispositivo si controlla dal telefono tramite un'app web (Web Bluetooth), installabile come PWA e funzionante **offline** dopo il primo avvio.
+MeshSRP è una rete privata di dispositivi ESP32 + modulo LoRa **DX-LR02** che si scambiano messaggi di testo **cifrati** (AES-128-GCM) senza alcuna infrastruttura: niente SIM, niente internet, niente server. Ogni dispositivo si controlla dal telefono tramite un'app web (Web Bluetooth), installabile come PWA e funzionante **offline** dopo il primo avvio.
 
 Nato come alternativa più semplice a Meshtastic per l'uso "io e te, pochi dispositivi": firmware identico su ogni nodo, identità assegnata dall'app, chiave di cifratura tua e condivisa solo tra i tuoi apparati.
 
