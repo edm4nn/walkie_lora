@@ -291,7 +291,6 @@ function handleIncomingPosition(msg) {
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
 
   state.peersSeen.add(msg.nickname);
-  document.getElementById('meta-peers').textContent = state.peersSeen.size;
 
   state.positions.set(msg.nickname, { lat, lon, rssi: msg.rssi, snr: msg.snr, lastSeen: Date.now() });
   refreshMapViews();
@@ -318,6 +317,11 @@ const state = {
   shareLocation: loadShareLocationPref(),
   positionBroadcastTimer: null,
   mapMode: 'radar',
+  connectedAt: null,
+  sentCount: 0,
+  receivedCount: 0,
+  lastRssi: null,
+  lastSnr: null,
 };
 
 /* ============================================================================
@@ -329,6 +333,8 @@ const screens = {
   pair: document.getElementById('screen-pair'),
   chat: document.getElementById('screen-chat'),
   map: document.getElementById('screen-map'),
+  sensors: document.getElementById('screen-sensors'),
+  settings: document.getElementById('screen-settings'),
 };
 function showScreen(name) {
   Object.values(screens).forEach(s => s.classList.remove('active'));
@@ -348,29 +354,40 @@ function signalClass(rssi) {
 }
 
 const messagesEl = document.getElementById('messages');
-function addMessageToUI({ own, nick, text, rssi, snr, status }) {
+const ICON_BROADCAST = '<svg class="msg-meta-icon" viewBox="0 0 24 24"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" fill="currentColor"/><path d="M7 9a7 7 0 0 1 10 0M4.5 6.5a11 11 0 0 1 15 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+
+function nowTime() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function addMessageToUI({ own, nick, text, rssi, snr }) {
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + (own ? 'own' : 'other');
+  wrap.dataset.text = text;
 
-  const meta = document.createElement('div');
-  meta.className = 'msg-meta';
-  if (own) {
-    meta.innerHTML = `<span class="msg-status">${status || ''}</span>`;
-  } else {
-    const cls = signalClass(rssi);
-    meta.innerHTML = `
-      <span class="msg-nick">${escapeHtml(nick)}</span>
-      <span class="signal ${cls}"><i></i><i></i><i></i><i></i></span>
-      <span>${rssi}dBm · SNR ${snr}dB</span>
-    `;
+  if (!own && nick) {
+    const nickEl = document.createElement('div');
+    nickEl.className = 'msg-nick';
+    nickEl.textContent = nick;
+    wrap.appendChild(nickEl);
   }
 
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.textContent = text;
-
-  wrap.appendChild(meta);
   wrap.appendChild(bubble);
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  const time = nowTime();
+  if (own) {
+    meta.innerHTML = `${ICON_BROADCAST}<span>${time}</span><span>·</span><span>LoRa</span><span class="msg-status"></span>`;
+  } else {
+    meta.innerHTML = `${ICON_BROADCAST}<span>${time}</span><span>·</span><span>LoRa</span><span>·</span><span>${rssi}dBm</span>`;
+  }
+  wrap.appendChild(meta);
+
   messagesEl.appendChild(wrap);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return wrap;
@@ -536,6 +553,7 @@ document.getElementById('btn-reject').addEventListener('click', async () => {
 async function enterChat() {
   document.getElementById('chat-nodename').textContent = state.device.name || 'Nodo';
   document.getElementById('conn-sub').textContent = 'connesso';
+  document.getElementById('settings-nodename').textContent = state.device.name || 'Nodo';
 
   // carica SF e nickname correnti dal nodo
   try {
@@ -555,7 +573,10 @@ async function enterChat() {
   document.getElementById('switch-share-location').classList.toggle('on', state.shareLocation);
   if (state.shareLocation) startPositionBroadcast();
 
-  updateTabActive('chat');
+  // registra l'orario di connessione, per la tab Sensori
+  state.connectedAt = Date.now();
+
+  renderTabbars('chat');
   showScreen('chat');
 }
 
@@ -578,12 +599,17 @@ async function sendChatText(text, opts) {
   if (!text || !state.sessionKey) return false;
 
   let el = null;
-  if (visible) el = addMessageToUI({ own: true, text, status: 'invio...' });
+  if (visible) {
+    el = addMessageToUI({ own: true, text });
+    el._statusEl = el.querySelector('.msg-status');
+    el._statusEl.textContent = 'invio...';
+  }
 
   try {
     const plaintext = new TextEncoder().encode(text);
     const packet = await aesEncrypt(state.sessionKey, plaintext);
     await state.chChatTx.writeValue(packet);
+    if (visible) state.sentCount++;
 
     if (visible) {
       el.dataset.pending = '1';
@@ -591,17 +617,25 @@ async function sendChatText(text, opts) {
       el._statusEl.textContent = 'in coda...';
       state._lastSentEl = el;
 
-      // rete di sicurezza: se l'ack non arriva entro pochi secondi, segnalalo
-      // invece di lasciare il messaggio bloccato su "in coda..." senza spiegazione
+      // rete di sicurezza: se l'ack non arriva entro pochi secondi, permetti
+      // di reinviare con un tocco invece di lasciare il messaggio bloccato
+      // senza spiegazione
       setTimeout(() => {
         if (el._statusEl.textContent === 'in coda...') {
-          el._statusEl.textContent = '⚠ nessuna risposta dal nodo';
+          el._statusEl.textContent = 'tocca per reinviare';
+          el._statusEl.classList.add('retry');
+          el._statusEl.onclick = () => sendChatText(el.dataset.text, { visible: true });
         }
       }, 6000);
     }
     return true;
   } catch (err) {
-    if (visible) el.querySelector('.msg-status').textContent = '✗ errore invio';
+    if (visible) {
+      el._statusEl = el.querySelector('.msg-status');
+      el._statusEl.textContent = 'tocca per reinviare';
+      el._statusEl.classList.add('retry');
+      el._statusEl.onclick = () => sendChatText(el.dataset.text, { visible: true });
+    }
     return false;
   }
 }
@@ -627,7 +661,9 @@ async function onChatMessageReceived(event) {
     }
 
     state.peersSeen.add(msg.nickname);
-    document.getElementById('meta-peers').textContent = state.peersSeen.size;
+    state.receivedCount++;
+    state.lastRssi = msg.rssi;
+    state.lastSnr = msg.snr;
 
     addMessageToUI({ own: false, nick: msg.nickname, text: msg.text, rssi: msg.rssi, snr: msg.snr });
   } catch (err) {
@@ -638,11 +674,6 @@ async function onChatMessageReceived(event) {
 /* ============================================================================
    Impostazioni
    ============================================================================ */
-
-const overlay = document.getElementById('settings-overlay');
-document.getElementById('btn-settings').addEventListener('click', () => overlay.classList.add('active'));
-document.getElementById('btn-settings-map').addEventListener('click', () => overlay.classList.add('active'));
-overlay.addEventListener('click', e => { if (e.target === overlay) overlay.classList.remove('active'); });
 
 function selectSfOption(sf) {
   document.querySelectorAll('.sf-opt').forEach(o => {
@@ -693,7 +724,6 @@ document.getElementById('toggle-share-location').addEventListener('click', () =>
 
 document.getElementById('btn-forget').addEventListener('click', () => {
   forgetTrustedNode();
-  overlay.classList.remove('active');
   stopPositionBroadcast();
   if (state.device && state.device.gatt.connected) state.device.gatt.disconnect();
   showScreen('connect');
@@ -701,31 +731,102 @@ document.getElementById('btn-forget').addEventListener('click', () => {
 });
 
 document.getElementById('btn-disconnect').addEventListener('click', () => {
-  overlay.classList.remove('active');
   stopPositionBroadcast();
   if (state.device && state.device.gatt.connected) state.device.gatt.disconnect();
 });
 
 /* ============================================================================
-   Tab bar (Chat / Mappa)
+   Filtri squadra e messaggi vocali — segnaposto, non ancora implementati
+   (il protocollo dei messaggi non ha un campo "gruppo", e l'invio voce via
+   LoRa richiede un formato dati dedicato non ancora progettato)
    ============================================================================ */
 
-function updateTabActive(view) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-}
-
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const view = btn.dataset.view;
-    updateTabActive(view);
-    showScreen(view);
-    if (view === 'map') {
-      initGeolocation(); // vedere se stessi sul radar non richiede di condividere la posizione
-      if (state.mapMode === 'tiles') ensureLeafletMap();
-      refreshMapViews();
-    }
+document.querySelectorAll('#filter-chips .chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    if (chip.dataset.group === 'tutti') return; // unico filtro realmente attivo
+    toast('Gruppi/squadre: funzionalità in sviluppo');
   });
 });
+
+let pttToastShown = false;
+document.getElementById('btn-ptt').addEventListener('pointerdown', () => {
+  if (!pttToastShown) {
+    toast('Messaggi vocali: funzionalità in sviluppo');
+    pttToastShown = true;
+    setTimeout(() => { pttToastShown = false; }, 3000);
+  }
+});
+
+/* ============================================================================
+   Sensori — mostra i dati reali disponibili lato PWA; il resto (batteria,
+   temperatura, duty cycle) richiede una characteristic BLE non ancora esposta
+   dal firmware.
+   ============================================================================ */
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function updateSensorsView() {
+  document.getElementById('sensor-uptime').textContent =
+    state.connectedAt ? formatUptime(Date.now() - state.connectedAt) : '–';
+  document.getElementById('sensor-sent').textContent = state.sentCount;
+  document.getElementById('sensor-received').textContent = state.receivedCount;
+  document.getElementById('sensor-last-rssi').textContent =
+    state.lastRssi != null ? `${state.lastRssi}dBm` : '–';
+  document.getElementById('sensor-peers').textContent = state.peersSeen.size;
+}
+
+setInterval(() => {
+  if (screens.sensors.classList.contains('active')) updateSensorsView();
+}, 1000);
+
+/* ============================================================================
+   Tab bar (Chat / Mappa / Sensori / Impostazioni)
+   ============================================================================ */
+
+const TAB_ICONS = {
+  chat: '<svg viewBox="0 0 24 24"><path d="M4 5h16v10H9l-4 4v-4H4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="miter"/></svg>',
+  map: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M12 2v3.5M12 18.5V22M2 12h3.5M18.5 12H22" stroke="currentColor" stroke-width="1.6"/></svg>',
+  sensors: '<svg viewBox="0 0 24 24"><path d="M2 12h4l1.5-6 3 12 2-9 1.5 3h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="miter" stroke-linecap="square"/></svg>',
+  settings: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2.5v3M12 18.5v3M4 4l2.2 2.2M17.8 17.8L20 20M2.5 12h3M18.5 12h3M4 20l2.2-2.2M17.8 6.2L20 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg>',
+};
+const TABS = [
+  { id: 'chat', label: 'CHAT' },
+  { id: 'map', label: 'MAPPE' },
+  { id: 'sensors', label: 'SENSORI' },
+  { id: 'settings', label: 'IMPOSTAZIONI' },
+];
+
+function renderTabbars(activeView) {
+  const html = TABS.map(t => `
+    <button class="tab-btn${t.id === activeView ? ' active' : ''}" data-view="${t.id}">
+      ${TAB_ICONS[t.id]}<span>${t.label}</span>
+    </button>
+  `).join('');
+  document.querySelectorAll('.tabbar').forEach(bar => { bar.innerHTML = html; });
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchView(btn.dataset.view));
+  });
+}
+
+function switchView(view) {
+  renderTabbars(view);
+  showScreen(view);
+  if (view === 'map') {
+    initGeolocation(); // vedere se stessi sul radar non richiede di condividere la posizione
+    if (state.mapMode === 'tiles') ensureLeafletMap();
+    refreshMapViews();
+  } else if (view === 'sensors') {
+    updateSensorsView();
+  }
+}
 
 document.querySelectorAll('.map-mode-btn').forEach(btn => {
   btn.addEventListener('click', () => {
