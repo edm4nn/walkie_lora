@@ -338,11 +338,10 @@ async function connectToNode() {
     const nodePubVal = await state.chNodePub.readValue();
     state.nodePub = new Uint8Array(nodePubVal.buffer);
 
-    // sottoscrizioni alle notify
+    // sottoscrizioni alle notify (va fatto prima di scrivere la pubkey, cosi'
+    // non perdiamo la notifica del salt che il nodo manda in risposta)
     await state.chSession.startNotifications();
     state.chSession.addEventListener('characteristicvaluechanged', onSessionSaltChanged);
-    const initialSalt = await state.chSession.readValue();
-    state.sessionSalt = new Uint8Array(initialSalt.buffer);
 
     await state.chChatRx.startNotifications();
     state.chChatRx.addEventListener('characteristicvaluechanged', onChatMessageReceived);
@@ -352,12 +351,18 @@ async function connectToNode() {
 
     // calcola il segreto condiviso (sempre lo stesso finche' priv/nodePub non cambiano)
     state.sharedSecret = nacl.scalarMult(state.myKeys.priv, state.nodePub);
-    recomputeSessionKey();
 
-    // annuncia la propria pubkey al nodo (avvia la ceremony di pairing, o
-    // l'autenticazione automatica se questo nodo e' gia' fidato)
-    const trusted = getTrustedNodePub();
+    // il nodo genera un salt fresco esattamente quando riceve la nostra pubkey
+    // e lo notifica subito: aspettiamo QUELLA notifica specifica invece di
+    // leggerne una eventualmente letta in anticipo, per essere certi di usare
+    // lo stesso identico salt che usa il nodo nello stesso istante
+    const saltPromise = new Promise((resolve) => { state._onNextSalt = resolve; });
+
     await state.chPhonePub.writeValue(state.myKeys.pub);
+    state.sessionSalt = await saltPromise;
+    await recomputeSessionKey();
+
+    const trusted = getTrustedNodePub();
 
     radar.classList.remove('scanning');
 
@@ -390,8 +395,19 @@ async function recomputeSessionKey() {
 }
 
 function onSessionSaltChanged(event) {
-  state.sessionSalt = new Uint8Array(event.target.value.buffer);
-  recomputeSessionKey(); // rotazione periodica lato firmware: si riallinea da sola
+  const salt = new Uint8Array(event.target.value.buffer);
+  state.sessionSalt = salt;
+
+  if (state._onNextSalt) {
+    // qualcuno sta aspettando specificamente questo salt (pairing/auth in corso)
+    const resolve = state._onNextSalt;
+    state._onNextSalt = null;
+    resolve(salt);
+  } else {
+    // notifica "spontanea": e' una rotazione periodica della chiave di sessione
+    // lato nodo, ricalcoliamo subito la nostra per restare allineati
+    recomputeSessionKey();
+  }
 }
 
 function onDisconnected() {
