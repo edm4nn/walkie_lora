@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="icons/icon-192.png" alt="MeshSRP logo" width="514" height="514">
+<img src="icons/icon-512.png" alt="MeshSRP logo" width="150" height="150">
 
 # MeshSRP
 
