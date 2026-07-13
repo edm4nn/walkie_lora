@@ -390,8 +390,18 @@ function bytesEqual(a, b) {
   return true;
 }
 
+function toHexDbg(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function recomputeSessionKey() {
   state.sessionKey = kdf(32, state.sharedSecret, state.sessionSalt, 'session-key|');
+  console.log('[DEBUG] === recomputeSessionKey ===');
+  console.log('[DEBUG] myKeys.pub:', toHexDbg(state.myKeys.pub));
+  console.log('[DEBUG] nodePub:', toHexDbg(state.nodePub));
+  console.log('[DEBUG] sharedSecret:', toHexDbg(state.sharedSecret));
+  console.log('[DEBUG] sessionSalt:', toHexDbg(state.sessionSalt));
+  console.log('[DEBUG] sessionKey:', toHexDbg(state.sessionKey));
 }
 
 function onSessionSaltChanged(event) {
@@ -482,6 +492,9 @@ async function sendMessage() {
   try {
     const plaintext = new TextEncoder().encode(text);
     const packet = await aesEncrypt(state.sessionKey, plaintext);
+    console.log('[DEBUG] === sendMessage ===');
+    console.log('[DEBUG] sessionKey usata per cifrare:', toHexDbg(state.sessionKey));
+    console.log('[DEBUG] pacchetto:', packet.length, 'byte, nonce:', toHexDbg(packet.slice(0, 12)), 'tag:', toHexDbg(packet.slice(-16)));
     await state.chChatTx.writeValue(packet);
     // la conferma definitiva arriva su chStatus (onStatusNotification):
     // qui segnamo solo che e' stato scritto sul canale BLE
